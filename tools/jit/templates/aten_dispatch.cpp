@@ -1,9 +1,12 @@
 #include "aten_dispatch.h"
+#include "torch/csrc/autograd/profiler.h"
 #include "torch/csrc/jit/interned_strings.h"
+#include "torch/csrc/jit/tensor_conversions.h"
 #include "torch/csrc/utils/functional.h"
 
 #include <unordered_map>
 #include <cstring>
+#include <tuple>
 
 // ${generated_comment}
 
@@ -15,23 +18,66 @@ using at::Scalar;
 using at::Tensor;
 using at::IntList;
 using at::TensorList;
-using operator_constructor = std::function<TensorOp(jit::Node*)>;
 
 namespace {
 
-variable_list pack_list(Tensor v) { return { std::move(v) }; }
-variable_list pack_list(Scalar v) { return { v.toTensor() }; }
-variable_list pack_list(std::vector<Tensor> t) { return fmap<Variable>(t); }
-variable_list pack_list(std::tuple<Tensor, Tensor> v) {
-  return { std::move(std::get<0>(v)), std::move(std::get<1>(v)) };
+// The packer here is carefully written not to make any unnecessary
+// copies.
+
+// pack takes the return values of aten functions pushes them onto the stack
+template<typename T>
+void pack(Stack & stack, T&& v) {
+  stack.push_back(as_tensor(std::move(v)));
 }
-variable_list pack_list(std::tuple<Tensor, Tensor, Tensor> v) {
-  return { std::get<0>(v), std::get<1>(v), std::get<2>(v) };
+template<>
+void pack(Stack & stack, Tensor&& v) {
+  stack.push_back(std::move(v));
+}
+template<>
+void pack(Stack & stack, std::vector<Tensor>&& ts) {
+  for(auto& t : ts) {
+    stack.push_back(std::move(t));
+  }
 }
 
-std::vector<Tensor> as_tensor_list(const variable_list& vars) {
-  return fmap(vars, [](Variable v) { return static_cast<Tensor>(v); });
+template<std::size_t remaining, typename... Args>
+struct TuplePacker
+{
+  // NB: *Not* a universal reference.
+  static void execute(Stack & stack, std::tuple<Args...> && t)
+  {
+    // NB: The move here does not "destroy" the entire tuple, that is
+    // not what std::move does; only the particular tuple index
+    // processed here gets stolen.
+    pack(stack, std::get<sizeof...(Args) - remaining>(std::move(t)));
+    TuplePacker<remaining - 1, Args...>::execute(stack, std::move(t));
+  }
+};
+
+template<typename... Args>
+struct TuplePacker<0, Args...>
+{
+  static void execute(Stack & stack, std::tuple<Args...> && t) {};
+};
+
+template<typename... Args>
+void pack(Stack & stack, std::tuple<Args...> && t) {
+  TuplePacker<sizeof...(Args), Args...>::execute(stack, std::move(t));
 }
+
+int deviceForInputs(Stack & stack, size_t N) {
+  if(N == 0)
+    return -1;
+  auto & t = *(stack.end() - N);
+  return t.type().is_cuda() ? (int) t.get_device() : -1;
+}
+
+// A list of functions taking TensorList arguments (where we can't use
+// the number of inputs to choose an overload).
+std::unordered_set<Symbol> tensor_vararg_fns = {
+  aten::cat,
+  aten::stack,
+};
 
 template<size_t N>
 std::array<bool, N> as_bool_array(const std::vector<int64_t>& vec) {
@@ -41,17 +87,27 @@ std::array<bool, N> as_bool_array(const std::vector<int64_t>& vec) {
   return res;
 }
 
+
+using operator_constructor = std::function<TensorOp(jit::Node*)>;
 std::unordered_map<std::string, operator_constructor> constructors = {
   ${constructors}
 };
 
 std::string getDescriptor(jit::Node* n) {
   std::stringstream s;
-  s << symbolToString(n->kind()) << "-" << n->inputs().size();
-  std::vector<const char*> attr_names = fmap(n->attributeNames(), &symbolToString);
-  std::sort(attr_names.begin(), attr_names.end(), [](const char *a, const char *b) {
-    return std::strcmp(a, b) < 0;
+  JIT_ASSERTM(n->kind().is_aten(), "%s is not an ATen op", n->kind().toDisplayString());
+  s << n->kind().toUnqualString();
+  if (tensor_vararg_fns.count(n->kind()) == 0)
+    s << "-" << n->inputs().size();
+  else
+    s << "-*";
+  std::vector<std::string> attr_names = fmap(n->attributeNames(), [&](Symbol x) {
+    std::stringstream ss;
+    ss << x.toUnqualString() << "_" << toString(n->kindOf(x));
+    return ss.str();
   });
+  std::sort(attr_names.begin(), attr_names.end());
+
   for (const auto & name : attr_names)
     s << "-" << name;
   return s.str();
@@ -59,14 +115,23 @@ std::string getDescriptor(jit::Node* n) {
 
 } // anonymous namespace
 
-TensorOp getTensorOp(jit::Node* n) {
+at::optional<TensorOp> findTensorOp(jit::Node* n) {
   auto signature = getDescriptor(n);
-  try {
-    return constructors.at(signature)(n);
-  } catch (std::out_of_range &e) {
-    throw std::runtime_error("Unsupported op descriptor: " + signature + ". "
-                             "File a bug report.");
+  auto it = constructors.find(signature);
+  if(it == constructors.end()) {
+    return at::nullopt;
   }
-};
+  return it->second(n);
+}
+TensorOp getTensorOp(jit::Node* n) {
+  auto op = findTensorOp(n);
+  if (!op) {
+    throw std::runtime_error(
+        "Unsupported op descriptor: " + getDescriptor(n) +
+        ". "
+        "File a bug report.");
+  }
+  return op.value();
+}
 
 }} // namespace torch::jit

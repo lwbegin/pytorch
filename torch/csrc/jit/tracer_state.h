@@ -1,27 +1,28 @@
 #pragma once
 
-#include "torch/csrc/jit/ir.h"
-#include "torch/csrc/jit/assert.h"
+#include "torch/csrc/autograd/edge.h"
+#include "torch/csrc/autograd/variable.h"
 
-#include <memory>
-#include <mutex>
-#include <vector>
+#include <atomic>
 #include <cstdint>
 #include <list>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
-namespace torch { namespace autograd {
-
-struct Variable;
-struct Function;
-
-}}
+namespace torch { namespace jit {
+struct Graph;
+struct Value;
+struct VariableFlags;
+}} // namespace torch::jit
 
 namespace torch { namespace jit { namespace tracer {
 
-using torch::autograd::Variable;
-using torch::autograd::Function;
-using variable_list = std::vector<Variable>;
-using function_list = std::vector<std::pair<std::shared_ptr<Function>, int>>;
+using edge_list = std::vector<autograd::Edge>;
+using variable_list = std::vector<autograd::Variable>;
 
 // TracingState tracks the necessary state when we are tracing the execution of
 // autograd code; most importantly, it holds a reference to the actual IR
@@ -33,59 +34,47 @@ using function_list = std::vector<std::pair<std::shared_ptr<Function>, int>>;
 // from arising when a variable that participated in a trace outlives the
 // actual trace itself.
 
-struct VariableFlags {
-  static VariableFlags of(const Variable& var);
-  bool verify(const Variable& var);
-
-  bool requires_grad;
-  bool is_volatile;
-  bool was_null;
-};
+using io_variable_flags_list = std::vector<
+    std::pair<std::vector<VariableFlags>, std::vector<VariableFlags>>>;
 
 struct TracingState : public std::enable_shared_from_this<TracingState> {
-  TracingState(std::size_t num_stages)
-    : graph(new Graph())
-    , active(false)
-    , num_stages(num_stages)
-    , eval_count(0)
-    , var_flags(num_stages)
-    , output_edges(num_stages) {}
+  explicit TracingState(size_t num_stages);
+  ~TracingState();
 
-  // XXX: graph can be NULL if it's a failed trace (failed = didn't capture all
-  // the stages we care about)
   std::shared_ptr<Graph> graph;
   bool active;
 
   // Used to free the Graph as soon as we know this trace will fail
-  std::size_t num_stages;
-  std::atomic<std::size_t> eval_count;
+  size_t num_stages;
+  std::atomic<size_t> eval_count;
 
-  // void* is an unsafe TH.  NON-OWNING, so it might get invalidated.
-  // TODO: Perhaps, turn this into an owning reference.  The buffers
-  // are persistent, so this won't lead to a leak.
-  std::unordered_map<void*, Node*> buffer_map;
   // A pair of (input_flags, output_flags) for each stage
-  std::vector<std::pair<std::vector<VariableFlags>, std::vector<VariableFlags>>> var_flags;
-  std::vector<function_list> output_edges;
+  io_variable_flags_list var_flags;
+  std::vector<edge_list> output_edges;
 
   std::mutex mutex;
   variable_list inputs; // Used only for the duration of first stage
 
-  std::unique_lock<std::mutex> lock() { return std::unique_lock<std::mutex>(mutex); };
+  bool creates_handles; // should python ops ever get handles? Or should
+                        // we just record them as is.
 
-  bool is_expired() const {
+  std::unique_lock<std::mutex> lock() {
+    return std::unique_lock<std::mutex>(mutex);
+  }
+
+  bool is_expired() const noexcept {
     return !graph;
   }
 
-  bool is_complete() const {
-    return !is_expired() && graph->stage() == num_stages - 1;
-  }
+  bool is_complete() const;
+  void push_scope(const std::string& scope_name);
+  void pop_scope();
 };
 
 struct ValueTracingStateElem {
   std::weak_ptr<TracingState> state;
   // it's only valid to use this field if !state.exired()
-  Node* trace = nullptr;
+  Value* trace = nullptr;
 
   void reset() {
     state.reset();
@@ -99,4 +88,4 @@ struct FunctionTracingState {
   bool in_eval_subgraph = false;
 };
 
-}}}
+}}} // namespace torch::jit::tracer

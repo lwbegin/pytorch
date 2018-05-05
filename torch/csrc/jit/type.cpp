@@ -5,11 +5,7 @@
 namespace torch { namespace jit {
 
 std::ostream& operator<<(std::ostream & out, const Type & t) {
-  TYPE_IF(&t, MultiType)
-    out << "Multi";
-  TYPE_ELSEIF(HandleType)
-    out << "Handle";
-  TYPE_ELSEIF(TensorType)
+  if(auto value = t.cast<TensorType>()) {
     out << at::toString(value->scalarType()) << "(";
     auto& sizes = value->sizes();
     auto& strides = value->strides();
@@ -27,8 +23,25 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
       }
     }
     out << ")";
-  TYPE_END()
+  } else if(t.kind() == TypeKind::HandleType) {
+    out << "Handle";
+  } else if(t.kind() == TypeKind::DynamicType) {
+    out << "Dynamic";
+  } else if(t.kind() == TypeKind::TupleType) {
+    out << "Tuple";
+  } else {
+    barf("unknown type kind");
+  }
   return out;
+}
+
+TypePtr HandleType::get() {
+  static auto value = std::make_shared<HandleType>();
+  return value;
+}
+TypePtr DynamicType::get() {
+  static auto value = std::make_shared<DynamicType>();
+  return value;
 }
 
 }} // namespace torch::jit

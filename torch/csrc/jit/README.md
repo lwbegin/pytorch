@@ -1,9 +1,27 @@
 # jit
 
 The jit directory contains infrastructure for a just-in-time compiler for
-PyTorch.
+PyTorch and associated 'script' subset of python it can execute directly.
 
-TODO: Describe the general philosophy of the JIT.
+The JIT compiler has several phases.
+
+1. Parsing - An AST (defined in tree_views.h) is generated either by parsing a string of python-like code (`jit/script/parser.h`) or by translation from the Python AST (`jit/frontend.py`). This phase only checks for syntactic correctness and for use of the syntactic subset of python that
+the script supports.
+
+2. Semantic Checking/Specialization - We lower the AST into an IR Graph object. In this
+phase we check that variables are in scope and resolve any free variables to python objects.
+When we find free variables that are python objects, or references to non-first-class values
+such as modules, we temporarily represent them as `SugaredValue` objects. This phase then
+de-sugars these values by e.g. inserting a `PythonOp` into the graph to call a python function.
+
+3. Optimizations - A `GraphExecutor` works on an initial `Graph` object, performing optimizations,
+possibly differentiating it, and possibly specializing it to a particular size.
+
+4. Translation to Instructions - to execute a graph, it is lowered by the interpreter
+into a linear list of Instruction objects.
+
+5. Execution - the interpreter reads the instruction stream, executing ATen operations and
+any generated code fragments.
 
 ## Well-known functions
 
@@ -28,7 +46,7 @@ A well-known function is usually implemented in several parts:
   operator.
 
 * There is a runtime interpretation of the operator in
-  `torch/csrc/autograd/functions/jit_closure.cpp`, which specifies how we
+  `torch/csrc/autograd/functions/interpreter.cpp`, which specifies how we
   actually interpret programs that contain such an operator.
 
 So, whence the specifications!  For the most part, we are following
@@ -74,4 +92,3 @@ other well-known functions which are specific to PyTorch.
       IR) which specifies how to execute the operation.)</dd>
     </dl>
   * **output**: 1 - ∞ (same as outputs of autograd closure)
-

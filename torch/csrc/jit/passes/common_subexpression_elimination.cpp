@@ -5,6 +5,8 @@
 
 #include "torch/csrc/jit/interned_strings.h"
 #include "torch/csrc/jit/passes/common_subexpression_elimination.h"
+#include "torch/csrc/utils/functional.h"
+#include "torch/csrc/utils/hash.h"
 
 namespace torch { namespace jit {
 
@@ -17,7 +19,7 @@ bool tensorEqual(const at::Tensor& lhs, const at::Tensor& rhs) {
 bool tensorListEqual(const std::vector<at::Tensor>& lhs, const std::vector<at::Tensor>& rhs) {
   if (lhs.size() != rhs.size()) return false;
   return std::equal(lhs.begin(), lhs.end(), rhs.begin(), tensorEqual);
-};
+}
 
 
 // Check whether two nodes have the same attributes in CSE.
@@ -52,13 +54,16 @@ bool attributesEqualCSE(const Node* lhs, const Node* rhs) {
       COMPARE_ATTRIBUTEVALUE(is)
       COMPARE_ATTRIBUTEVALUE(s)
       COMPARE_ATTRIBUTEVALUE(ss)
-      case AttributeKind::t:
+      case AttributeKind::t: {
         if (!tensorEqual(lhs->t(name), rhs->t(name))) return false;
         break;
-      case AttributeKind::ts:
+      }
+      case AttributeKind::ts: {
         if (!tensorListEqual(lhs->ts(name), rhs->ts(name))) return false;
-      default:
-        // NB: Comparison of nodes with graph(s) will return false.
+        break;
+      }
+      case AttributeKind::g:
+      case AttributeKind::gs:
         return false;
     }
 
@@ -68,21 +73,12 @@ bool attributesEqualCSE(const Node* lhs, const Node* rhs) {
   return true;
 }
 
-// Later, if someone wants to reuse this, it can be moved to some header files.
-inline void hash_combine(size_t& seed, size_t value) {
-  seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-}
-
 struct HashNodeCSE {
   size_t operator()(const Node* k) const {
     JIT_ASSERT(k != nullptr);
-    size_t seed = 0;
-    hash_combine(seed, k->kind());
-    hash_combine(seed, k->stage());
-    for (auto i : k->inputs()) {
-      hash_combine(seed, i->unique());
-    }
-    return seed;
+    return get_hash(k->kind(),
+                    k->stage(),
+                    fmap(k->inputs(), [](const Value *v) { return v->unique(); }));
   }
 };
 
@@ -98,9 +94,12 @@ struct EqualNodeCSE {
     if (lhs->stage() != rhs->stage()) return false;
 
     // Check whether the inputs are the same.
-    if (lhs->inputs().size() != rhs->inputs().size()) return false;
+    auto lhs_inputs = lhs->inputs();
+    auto rhs_inputs = rhs->inputs();
 
-    if (!std::equal(lhs->inputs().begin(), lhs->inputs().end(), rhs->inputs().begin())) return false;
+    if (lhs_inputs.size() != rhs_inputs.size()) return false;
+
+    if (!std::equal(lhs_inputs.begin(), lhs_inputs.end(), rhs_inputs.begin())) return false;
 
     // Check the attributes.
     if (!attributesEqualCSE(lhs, rhs)) return false;
@@ -113,14 +112,13 @@ struct EqualNodeCSE {
 
 // The function implements common subexpression elimination.
 // Since the nodes are visited in topological order, one pass is enough.
-void EliminateCommonSubexpression(std::shared_ptr<Graph>& graph) {
-  auto nodes = graph->nodes();
+void EliminateCommonSubexpression(Block * block) {
   std::unordered_set<Node*, HashNodeCSE, EqualNodeCSE> subexprs;
-  for (auto it = nodes.begin(); it != nodes.end(); ++ it) {
+  for (auto it = block->nodes().begin(); it != block->nodes().end(); ++ it) {
     auto node = *it;
-    if (node->kind() == kPythonOp
-        || node->kind() == kCppOp
-        || node->kind() == kEval
+    if (node->kind() == prim::PythonOp
+        || node->kind() == prim::CppOp
+        || node->kind() == prim::Eval
        ) {
       // Do NOT have enough information to do CSE on these nodes.
       continue;
@@ -134,29 +132,15 @@ void EliminateCommonSubexpression(std::shared_ptr<Graph>& graph) {
     } else {
       // Subexpression exists, replace the uses of node, and destroy it.
       auto existing = *subit;
-      JIT_ASSERT(existing != node);
-      const use_list & uses = node->uses();
-      const use_list & reuses= existing->uses();
-      if (node->hasMultipleOutputs()) {
-        // For Multi-Output nodes, all its uses should be Select nodes.
-        JIT_ASSERT(uses.size() == reuses.size());
-        // Replace the uses of Select nodes.
-        for (size_t i = 0; i < uses.size(); ++ i) {
-          JIT_ASSERT(uses[i].user->kind() == kSelect);
-          JIT_ASSERT(reuses[i].user->kind() == kSelect);
-          uses[i].user->replaceAllUsesWith(reuses[i].user);
-        }
-        // Destroy Select nodes.
-        while (uses.size() > 0) {
-          uses[0].user->destroy();
-        }
-      } else {
-        node->replaceAllUsesWith(existing);
-      }
+      node->replaceAllUsesWith(existing);
       // Destroy the node.
       it.destroyCurrent();
     }
   }
+}
+
+void EliminateCommonSubexpression(std::shared_ptr<Graph>& graph) {
+  EliminateCommonSubexpression(graph->block());
 }
 
 }}
